@@ -1,0 +1,988 @@
+#!/usr/bin/env sh
+
+u_gc_tmpfile() {
+  dir="${1:-$HOME/pjt}"
+  printf 'INFO: gc dir: %s\n' "$dir" >&2
+
+  find $dir -type f -name '*.swp' -print -delete
+  find $dir -type f -name '#*#' -print -delete
+}
+
+u_music() {
+  # --no-playlist
+  yt-dlp -x --audio-format flac --audio-quality 0 --no-playlist -o '%(title)s.%(ext)s' "$@"
+}
+
+#---- Xfce4
+u_xf_dpi() {
+  xfconf-query -c xsettings -p /Xft/DPI -s $1
+}
+
+u_xf_presentation_toggle() {
+  xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/presentation-mode -T
+}
+
+u_xf_gather_windows() (
+  set -- $(xprop -root _NET_WORKAREA | grep -oE '[0-9]+' | head -4)
+  [ $# -eq 4 ] || exit 1
+  wx=$1 wy=$2 ww=$3 wh=$4
+  for id in $(xprop -root _NET_CLIENT_LIST | grep -oE '0x[0-9a-f]+'); do
+    case $(xprop -id "$id" _NET_WM_WINDOW_TYPE 2>/dev/null) in
+      *DOCK*|*DESKTOP*|*NOTIFICATION*|*TOOLTIP*) continue ;;
+    esac
+    case $(xprop -id "$id" _NET_WM_STATE 2>/dev/null) in
+      *FULLSCREEN*|*MAXIMIZED_VERT*|*HIDDEN*) continue ;;
+    esac
+    set -- $(xprop -id "$id" _NET_FRAME_EXTENTS 2>/dev/null | grep -oE '[0-9]+')
+    L=${1:-0} R=${2:-0} T=${3:-0} B=${4:-0}
+    set -- $(xwininfo -id "$id" 2>/dev/null | awk '/Absolute upper-left X/{x=$4}/Absolute upper-left Y/{y=$4}/^ *Width/{w=$2}/^ *Height/{h=$2}END{print x,y,w,h}')
+    [ $# -eq 4 ] || continue
+    cx=$1 cy=$2 w=$3 h=$4
+    name=$(xprop -id "$id" WM_NAME 2>/dev/null | sed -E 's/^[^"]*"//; s/"$//')
+    fx=$(( cx - L )); fy=$(( cy - T )); fw=$(( w + L + R )); fh=$(( h + T + B ))   # 프레임 포함 사각형
+    if [ "$fw" -gt "$ww" ] || [ "$fh" -gt "$wh" ]; then
+      wmctrl -i -r "$id" -b add,maximized_vert,maximized_horz
+      printf 'maximized: %s\n' "$name"
+      continue
+    fi
+    nx=$fx; ny=$fy
+    [ "$nx" -lt "$wx" ] && nx=$wx
+    [ "$ny" -lt "$wy" ] && ny=$wy
+    [ $(( nx + fw )) -gt $(( wx + ww )) ] && nx=$(( wx + ww - fw ))
+    [ $(( ny + fh )) -gt $(( wy + wh )) ] && ny=$(( wy + wh - fh ))
+    if [ "$nx" -ne "$fx" ] || [ "$ny" -ne "$fy" ]; then
+      wmctrl -i -r "$id" -e "1,$nx,$ny,-1,-1"   # gravity 1: x,y 는 프레임 왼쪽 위. 크기는 유지
+      printf 'moved: %s -> +%d+%d\n' "$name" "$nx" "$ny"
+    fi
+  done
+)
+
+u_xf_switch_monitor() {
+  case $1 in
+    "4K28")
+      xfconf-query -c xsettings -p /Xft/DPI -s 140
+      emacsclient -e '(u/switch-monitor "4K28")'
+      ;;
+    *)
+      xfconf-query -c xsettings -p /Xft/DPI -s 100
+      emacsclient -e "(u/switch-monitor)"
+      sleep 0.5; u_xf_gather_windows
+      sleep 1.5; u_xf_gather_windows
+      ;;
+  esac
+}
+
+#---- Util
+# u_pedit() {
+#   tmp=$(mktemp) || return 1
+#   cat > "$tmp"
+#   emacsclient "$tmp"
+#   rm -f "$tmp"
+# }
+u_pedit() (
+  dir=${TMPDIR:-/tmp}/pedit
+  mkdir -p "$dir" || exit 1
+  tmp=$(mktemp "$dir/pedit-XXXXXX") || exit 1
+  if [ -n "$1" ]; then
+    mv "$tmp" "$tmp.$1" || exit 1
+    tmp=$tmp.$1
+  fi
+  cat > "$tmp"
+  emacsclient -n -a '' "$tmp" > /dev/null
+)
+
+u_pedit_clean() (
+  dir=${TMPDIR:-/tmp}/pedit
+  [ -d "$dir" ] || exit 0
+  find "$dir" -type f -name 'pedit-*' -mtime +7 -exec rm -f {} +
+)
+
+u_hexl() (
+  n=
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -n) n=$2; shift 2 ;;
+      -n*) n=${1#-n}; shift ;;
+      --) shift; break ;;
+      -*) echo "u_hexl: unknown option: $1" >&2; return 2 ;;
+      *) break ;;
+    esac
+  done
+
+  if [ $# -gt 0 ]; then
+    cat -- "$@"
+  else
+    cat
+  fi | {
+    if [ -n "$n" ]; then head -n "$n"; else cat; fi
+  } | while IFS= read -r line; do
+    printf '%s\n' "$line" | od -A x -t x1 | sed '$d'
+  done
+)
+
+u_ts2date() {
+  date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+u_date2ts() {
+  date -d "$1" '+%s'
+}
+
+_u_tree_walk() (
+  dir="$1"
+  prefix="$2"
+  level="$3"
+  max_level="$4"
+  dirs_only="$5"
+
+  [ -n "$ZSH_VERSION" ] && setopt local_options null_glob
+
+  if [ "$max_level" -gt 0 ] && [ "$level" -gt "$max_level" ]; then
+    return
+  fi
+  for e in "$dir"/*; do
+    [ -e "$e" ] || continue
+    name="${e##*/}"
+    if [ -d "$e" ]; then
+      printf '%s|-- %s/\n' "$prefix" "$name"
+      [ -L "$e" ] || _u_tree_walk "$e" "${prefix}|   " $(( level + 1 )) "$max_level" "$dirs_only"
+    elif [ "$dirs_only" -eq 0 ]; then
+      printf '%s|-- %s\n' "$prefix" "$name"
+    fi
+  done
+)
+
+u_tree() {
+  _pt_max_level=0
+  _pt_dirs_only=0
+  _pt_root=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -L) _pt_max_level="$2"; shift 2 ;;
+      -d) _pt_dirs_only=1; shift ;;
+      *)  _pt_root="$1"; shift ;;
+    esac
+  done
+  _pt_root="${_pt_root:-.}"
+  _pt_root="${_pt_root%/}"
+  printf '%s/\n' "${_pt_root##*/}"
+  _u_tree_walk "$_pt_root" "" 1 "$_pt_max_level" "$_pt_dirs_only"
+}
+
+_u_cat_walk() (
+  dir="$1"
+  rel="$2"
+  level="$3"
+  max_level="$4"
+  pat="$5"
+  all="$6"
+  [ -n "$ZSH_VERSION" ] && setopt local_options null_glob glob_subst
+  if [ "$max_level" -gt 0 ] && [ "$level" -gt "$max_level" ]; then
+    return 0
+  fi
+  if [ "$all" -eq 1 ]; then
+    set -- "$dir"/* "$dir"/.[!.]* "$dir"/..?*
+  else
+    set -- "$dir"/*
+  fi
+  for e in "$@"; do
+    [ -e "$e" ] || continue
+    name="${e##*/}"
+    if [ -d "$e" ]; then
+      [ -h "$e" ] || _u_cat_walk "$e" "${rel}${name}/" $(( level + 1 )) "$max_level" "$pat" "$all"
+    elif [ -f "$e" ]; then
+      case "$name" in
+        $pat) ;;
+        *) continue ;;
+      esac
+      printf '# %s%s\n' "$rel" "$name"
+      cat -- "$e"
+      if [ -s "$e" ] && [ -n "$(tail -c 1 -- "$e")" ]; then
+        printf '\n'
+      fi
+      printf '%s\n' '---'
+    fi
+  done
+  return 0
+)
+
+u_cat() {
+  _pc_max_level=0
+  _pc_pat='*'
+  _pc_all=0
+  _pc_root=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -L|-p)
+        if [ $# -lt 2 ]; then
+          printf 'u_cat: %s requires an argument\n' "$1" >&2
+          return 2
+        fi
+        case "$1" in
+          -L) _pc_max_level="$2" ;;
+          -p) _pc_pat="$2" ;;
+        esac
+        shift 2
+        ;;
+      -a) _pc_all=1; shift ;;
+      --) shift; [ $# -gt 0 ] && _pc_root="$1"; break ;;
+      *)  _pc_root="$1"; shift ;;
+    esac
+  done
+  case "$_pc_max_level" in
+    ''|*[!0-9]*)
+      printf 'u_cat: -L needs a non-negative integer\n' >&2
+      return 2
+      ;;
+  esac
+  _pc_root="${_pc_root:-.}"
+  _pc_root="${_pc_root%/}"
+  _pc_root="${_pc_root:-/}"
+  if [ -f "$_pc_root" ]; then
+    printf '# %s\n' "$_pc_root"
+    cat -- "$_pc_root"
+    if [ -s "$_pc_root" ] && [ -n "$(tail -c 1 -- "$_pc_root")" ]; then
+      printf '\n'
+    fi
+    printf '%s\n' '---'
+    return 0
+  fi
+  if [ ! -d "$_pc_root" ]; then
+    printf 'u_cat: %s: no such directory\n' "$_pc_root" >&2
+    return 1
+  fi
+  case "$_pc_root" in
+    .)  _pc_rel="${PWD##*/}/" ;;
+    /)  _pc_rel='/' ;;
+    *)  _pc_rel="${_pc_root##*/}/" ;;
+  esac
+  _u_cat_walk "$_pc_root" "$_pc_rel" 1 "$_pc_max_level" "$_pc_pat" "$_pc_all"
+}
+
+#---- Image
+u_ctr_img_delete_all() {
+  $1 images --format '{{.Repository}}:{{.Tag}}' | grep $2 | xargs -I {} $1 rmi {}
+}
+
+u_ctr_img_extract() {
+  cli=$1
+  img=$2
+  id=$($cli create $img)
+  $cli export $id | tar -C rootfs -xvf -
+  $cli rm $id
+}
+
+#---- Go
+u_godown() {
+  if [ "$#" -eq 0 ] || [ "$1" = "-h" ] ; then
+    printf "Usage: u_godown version [os] [arch]\n\n" >&2
+    printf "Examples:\n" >&2
+    printf "  u_godown 1.25.7\n" >&2
+    printf "  u_godown 1.25.7 linux\n" >&2
+    printf "  u_godown 1.25.7 linux amd64\n" >&2
+    [ "$1" = "-h" ]
+    return
+  fi
+
+  ver=$1
+  os="${2:-$(uname -s | tr '[:upper:]' '[:lower:]')}"
+  arch="${3:-$(uname -m)}"
+  case "$arch" in
+    x86_64) arch="amd64" ;;
+    aarch64) arch="arm64" ;;
+  esac
+
+  printf 'INFO: version: %s, os: %s, arch: %s\n' "$ver" "$os" "$arch" >&2
+  wget -O /tmp/go$ver.tar.gz https://dl.google.com/go/go$ver.$os-$arch.tar.gz
+  tar -xvf /tmp/go$ver.tar.gz -C /tmp
+  sudo mv /tmp/go /usr/local/go-$ver
+}
+
+u_gouse() {
+  if [ "$#" -eq 0 ] || [ "$1" = "-h" ] ; then
+    printf "Usage: u_gouse version\n\n" >&2
+    printf "Examples:\n" >&2
+    printf "  u_gouse 1.25.7\n" >&2
+    [ "$1" = "-h" ]
+    return
+  fi
+
+  if [ ! -d /usr/local/go-$1 ]; then
+    printf "ERROR: not found version: %s\n" "$1" >&2
+    return 1
+  fi
+
+  sudo ln -sfn /usr/local/go-$1 /usr/local/go
+}
+
+#---- Kube
+u_kpull() {
+  if [ "$#" -lt 2 ] || [ "$1" = "-h" ]; then
+    printf "Usage: u_kpull user server\n\n" >&2
+    printf "Examples:\n" >&2
+    printf "  u_kpull root 10.20.200.200\n" >&2
+    [ "$1" = "-h" ]
+    return
+  fi
+
+  user=$1
+  server=$2
+
+  f="$HOME/.kube/config-$server"
+  cache="$HOME/.kube/cache-$server"
+
+  printf "INFO: %s download ~/.kube/config...\n" "$server" >&2
+  scp "$user@$server:~/.kube/config" "$f" || { printf "ERROR: scp failed\n" >&2; return 1; }
+  [ -f "$f" ] || { printf "ERROR: server kubeconfig not exist\n" >&2; return 1; }
+  sed "s|kubernetes-admin|admin|g;s|kubernetes$|$server|g;s|l4.domain.accordions.co.kr|$server|g" "$f" > "$f".tmp && mv "$f".tmp "$f"
+
+  if [ -d "$cache" ]; then
+    rm -rf "$cache"
+    printf "INFO: rm %s\n" "$cache" >&2
+  fi
+}
+
+u_kuse() {
+  if [ -z "$1" ]; then
+    unset KUBECONFIG KUBECACHEDIR
+    printf "INFO: switched to local\n" >&2
+    return 0
+  fi
+
+  server=$1
+
+  f="$HOME/.kube/config-$server"
+
+  if [ ! -f "$f" ]; then
+    printf "ERROR: %s not found\n" "$f" >&2
+    return 1
+  fi
+
+  export KUBECONFIG="$f"
+  export KUBECACHEDIR="$HOME/.kube/cache-$server"
+
+  printf "INFO: switched to %s\n" "$server" >&2
+}
+
+u_kpo() (
+  base='NAMESPACE:.metadata.namespace'
+  base="$base,NAME:.metadata.name"
+  base="$base,PHASE:.status.phase"
+  base="$base,READY:.status.containerStatuses[*].ready"
+  base="$base,RESTARTS:.status.containerStatuses[*].restartCount"
+  base="$base,WAIT:.status.containerStatuses[*].state.waiting.reason"
+  base="$base,LAST_CODE:.status.containerStatuses[*].lastState.terminated.exitCode"
+  base="$base,LAST_REASON:.status.containerStatuses[*].lastState.terminated.reason"
+
+  extra='LAST_FIN:.status.containerStatuses[*].lastState.terminated.finishedAt'
+  extra="$extra,NODE:.spec.nodeName"
+  extra="$extra,IP:.status.podIP"
+
+  labels='LABELS:.metadata.labels'
+
+  ext=0 lab=0 scope=0 n=$# i=0
+  while [ "$i" -lt "$n" ]; do
+    arg=$1
+    shift
+    i=$((i + 1))
+    case $arg in
+      --extra)
+        ext=1
+        ;;
+      --show-labels)
+        lab=1
+        ;;
+      -A|--all-namespaces|-n*|--namespace*)
+        scope=1
+        set -- "$@" "$arg"
+        ;;
+      *)
+        set -- "$@" "$arg"
+        ;;
+    esac
+  done
+
+  cols=$base
+  [ "$ext" -eq 1 ] && cols="$cols,$extra"
+  [ "$lab" -eq 1 ] && cols="$cols,$labels"
+  [ "$scope" -eq 0 ] && set -- -A "$@"
+
+  kubectl get pods "$@" -o "custom-columns=$cols"
+)
+
+u_kponr() {
+  u_kpo "$@" | awk '
+    function reason_ok(r,    a, k, i) {
+      if (r == "" || r == "<none>") {
+        return 1
+      }
+      k = split(r, a, ",")
+      for (i = 1; i <= k; i++) {
+        if (a[i] != "<none>" && a[i] != "Completed" && a[i] != "Unknown") {
+          return 0
+        }
+      }
+      return 1
+    }
+
+    NR == 1 {
+      for (i = 1; i <= NF; i++) {
+        c[$i] = i
+      }
+      print
+      next
+    }
+
+    {
+      ph = $c["PHASE"]
+      rd = $c["READY"]
+      w  = $c["WAIT"]
+      lr = $c["LAST_REASON"]
+
+      running = (ph == "Running" && rd !~ /false/ && w == "<none>")
+      done    = (ph == "Succeeded")
+      healthy = (running || done) && reason_ok(lr)
+      if (!healthy) {
+        print
+      }
+    }
+  '
+}
+
+# u_kwdiff — watch a resource, print which fields changed per event.
+# usage: u_kwdiff [-a] [-x EXTRA_NOISE] <resource> [kubectl args...]
+#   -a          show every change (no noise filtering)
+#   -x PATTERN  append PATTERN (jq regex on dotted path) to the noise filter
+# e.g. u_kwdiff nodes
+#      u_kwdiff pods -n acc-crypto
+#      u_kwdiff deploy -A
+u_kwdiff() (
+  all=false
+  extra=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -a) all=true; shift ;;
+      -x) extra=$2; shift 2 ;;
+      --) shift; break ;;
+      *)  break ;;
+    esac
+  done
+  [ $# -ge 1 ] || { echo 'usage: u_kwdiff [-a] [-x PATTERN] <resource> [kubectl args]' >&2; return 2; }
+  command -v jq >/dev/null 2>&1 || { echo 'u_kwdiff: jq required' >&2; return 1; }
+
+  res=$1; shift
+
+  noise='resourceVersion|metadata\.generation|managedFields|last-applied-configuration|^status\.images'
+  [ -n "$extra" ] && noise="$noise|$extra"
+
+  state=$(mktemp -d) || return 1
+  trap 'rm -rf "$state"' EXIT INT TERM
+
+  prog='
+      ($old[0]) as $o | ($new[0]) as $n
+      | ([$o,$n] | map([paths(scalars)]) | add | unique)[] as $p
+      | ($p | map(tostring) | join(".")) as $path
+      | { path:$path, old:($o|getpath($p)), new:($n|getpath($p)) }
+      | select(.old != .new)
+      | select($all or ($path | test($noise) | not))
+      | "    \($path): \(.old|tojson) -> \(.new|tojson)"
+    '
+
+  kubectl get "$res" -w -o json --output-watch-events=true "$@" \
+    | jq -c --unbuffered '
+        { type,
+          uid:  .object.metadata.uid,
+          disp: ((.object.metadata.namespace // "") as $ns
+                 | (if $ns=="" then "" else $ns+"/" end) + .object.metadata.name),
+          object }' \
+            | while IFS= read -r ev; do
+    set -- $(printf '%s' "$ev" | jq -r '.type, .uid, .disp')
+    type=$1; uid=$2; disp=$3
+    ts=$(date '+%H:%M:%S')
+    prev="$state/$uid"
+    cur="$state/$uid.new"
+    printf '%s' "$ev" | jq -c '.object' > "$cur"
+
+    case $type in
+      ADDED)
+        printf '%s:%s: %s\n' "$ts" "$type" "$disp"
+        ;;
+      DELETED)
+        printf '%s:%s: %s\n' "$ts" "$type" "$disp"
+        rm -f "$prev" "$cur"
+        continue
+        ;;
+      MODIFIED)
+        if [ -f "$prev" ]; then
+          out=$(jq -rn --slurpfile old "$prev" --slurpfile new "$cur" --argjson all "$all" --arg noise "$noise" "$prog")
+        else
+          out=''
+        fi
+        printf '%s:%s: %s\n' "$ts" "$type" "$disp"
+        [ -n "$out" ] && printf '%s\n' "$out"
+        ;;
+    esac
+    mv "$cur" "$prev"
+  done
+)
+
+u_ksecret() {
+  ns="" name="" key="" val=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -h|--help)
+        printf "Usage: u_ksecret [-n <namespace>] <name> [-k <key>]\n\n" >&2
+        printf "Examples:\n" >&2
+        printf "  u_ksecret -n default cred\n" >&2
+        printf "  u_ksecret -n istio-system my-tls -k ca.crt > ca.crt\n" >&2
+        return 0
+        ;;
+      -n) ns="$2"; shift 2 ;;
+      -k|--key) key="$2"; shift 2 ;;
+      *)  name="$1"; shift ;;
+    esac
+  done
+  if [ -z "$name" ]; then
+    printf "Usage: u_ksecret [-n <namespace>] <name> [-k <key>]\n" >&2
+    return 1
+  fi
+  if [ -z "$ns" ]; then
+    ns=$(kubectl config view --minify -o jsonpath='{.contexts[0].context.namespace}')
+    ns="${ns:-default}"
+  fi
+
+  if [ -n "$key" ]; then
+    val=$(kubectl get secret -n "$ns" "$name" -o go-template="{{range \$k, \$v := .data}}{{if eq \$k \"$key\"}}V{{\$v|base64decode}}{{end}}{{end}}") || return 1
+    if [ -z "$val" ]; then
+      printf "ERROR: key %s not found in secret %s/%s\n" "$key" "$ns" "$name" >&2
+      return 1
+    fi
+    printf "%s" "${val#V}"
+  else
+    kubectl get secret -n "$ns" "$name" -o go-template='
+{{- range $k,$v := .data}}
+{{printf "%s: " $k}}{{if not $v}}{{$v}}{{else}}{{$v|base64decode}}{{end}}
+{{- end}}'
+  fi
+}
+
+u_kcm() {
+  ns="" name="" key="" val=""
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -h|--help)
+        printf "Usage: u_kcm [-n <namespace>] <name> [-k <key>]\n\n" >&2
+        printf "Examples:\n" >&2
+        printf "  u_kcm -n default app-config\n" >&2
+        printf "  u_kcm -n kube-system kube-proxy -k config.conf > config.conf\n" >&2
+        return 0
+        ;;
+      -n) ns="$2"; shift 2 ;;
+      -k|--key) key="$2"; shift 2 ;;
+      *)  name="$1"; shift ;;
+    esac
+  done
+  if [ -z "$name" ]; then
+    printf "Usage: u_kcm [-n <namespace>] <name> [-k <key>]\n" >&2
+    return 1
+  fi
+  if [ -z "$ns" ]; then
+    ns=$(kubectl config view --minify -o jsonpath='{.contexts[0].context.namespace}')
+    ns="${ns:-default}"
+  fi
+
+  if [ -n "$key" ]; then
+    val=$(kubectl get configmap -n "$ns" "$name" -o go-template="{{range \$k, \$v := .data}}{{if eq \$k \"$key\"}}V{{\$v}}{{end}}{{end}}") || return 1
+    if [ -z "$val" ]; then
+      printf "ERROR: key %s not found in configmap %s/%s\n" "$key" "$ns" "$name" >&2
+      return 1
+    fi
+    printf "%s" "${val#V}"
+  else
+    kubectl get configmap -n "$ns" "$name" -o go-template='
+{{- range $k,$v := .data}}
+{{printf "%s: " $k}}{{$v}}
+{{- end}}'
+  fi
+}
+
+_u_kfetch() {
+  f=$out/$1
+  shift
+
+  printf '. %s ... ' "$f" >&2
+  if kubectl get --request-timeout=0 --raw "$@" >"$f" 2>"$f.err"; then
+    rm -f "$f.err";
+    printf "o\n" >&2
+  else
+    printf "x -- %s\n" "$(tr -d '\n' <"$f.err")" >&2
+    rm -f "$f" "$f.err"
+  fi
+}
+
+u_kdiag_metrics() (
+  out=${1:-kdiag-metrics-$(kubectl config view -o jsonpath="{.contexts[?(@.name=='$(kubectl config current-context)')].context.cluster}")-$(date +'%Y%m%d%H%M%S')}
+  mkdir -p "$out" || return 1
+
+  port=$(kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o jsonpath='{.items[0].ports[0].port}')
+  for ip in $(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'); do
+    _u_kfetch "metrics-apiserver-$ip.txt" '/metrics' --server="https://$ip:$port"
+    _u_kfetch "metrics-etcd-$ip.txt" '/metrics' --server="http://$ip:2381"
+  done
+  for node in $(kubectl get nodes -o jsonpath='{.items[*].metadata.name}'); do
+    _u_kfetch "kubelet-$node.txt"  "/api/v1/nodes/$node/proxy/metrics"
+    _u_kfetch "cadvisor-$node.txt" "/api/v1/nodes/$node/proxy/metrics/cadvisor"
+  done
+)
+
+u_kdiag_pprof() (
+  out=${1:-kdiag-pprof-$(kubectl config view -o jsonpath="{.contexts[?(@.name=='$(kubectl config current-context)')].context.cluster}")-$(date +'%Y%m%d%H%M%S')}
+  mkdir -p "$out" || return 1
+
+  sec=${KDIAG_PPROF_CPU_SECONDS:-10}
+
+  port=$(kubectl get endpointslices -n default -l kubernetes.io/service-name=kubernetes -o jsonpath='{.items[0].ports[0].port}')
+  for ip in $(kubectl get nodes -l node-role.kubernetes.io/control-plane -o jsonpath='{.items[*].status.addresses[?(@.type=="InternalIP")].address}'); do
+    server=https://$ip:$port
+    _u_kfetch "cpu-s$sec-apiserver-$ip.pb.gz" "/debug/pprof/profile?seconds=$sec" --server="$server"
+    _u_kfetch "heap-apiserver-$ip.pb.gz" '/debug/pprof/heap' --server="$server"
+    _u_kfetch "allocs-apiserver-$ip.pb.gz" '/debug/pprof/allocs' --server="$server"
+    _u_kfetch "goroutine-apiserver-$ip.pb.gz" '/debug/pprof/goroutine' --server="$server"
+  done
+)
+
+u_kdiag() (
+  out=${1:-kdiag-$(kubectl config view -o jsonpath="{.contexts[?(@.name=='$(kubectl config current-context)')].context.cluster}")-$(date +'%Y%m%d%H%M%S')}
+  mkdir -p "$out" || return 1
+
+  u_kdiag_metrics "$out"
+  u_kdiag_pprof "$out"
+
+  printf "INFO: . %s/ (collected)\n" "$out" >&2
+)
+
+#---- completion
+
+# early return: source/direct execution
+[ -n "$BASH_VERSION" ] || [ -n "$ZSH_VERSION" ] || return 0 2>/dev/null || exit 0
+
+if [ -n "$ZSH_VERSION" ]; then
+  _zcomp_kuse() {
+    local -a targets
+    targets=($(find "$HOME/.kube" -maxdepth 1 -name "config-*" 2>/dev/null | sed 's|.*/config-||'))
+    _describe 'kubeconfig targets' targets
+  }
+
+  _zcomp_kpo() {
+    local context state line
+    typeset -A opt_args
+
+    _arguments \
+      '--extra[add LAST_FIN/NODE/IP columns]' \
+      '--show-labels[add LABELS column]' \
+      '-A[all namespaces]' \
+      '--all-namespaces[all namespaces]' \
+      '-n[namespace]:namespace:->ns' \
+      '*:: :->rest'
+
+    case $state in
+      ns)
+        local -a namespaces
+        namespaces=($(kubectl get namespaces -o go-template='{{range .items}}{{.metadata.name}} {{end}}' 2>/dev/null))
+        _describe 'namespace' namespaces
+        ;;
+    esac
+  }
+
+  _zcomp_ksecret() {
+    local context state state_descr line
+    typeset -A opt_args
+
+    _arguments \
+      '(-h --help)'{-h,--help}'[show help]' \
+      '-n[namespace]:namespace:->ns' \
+      '(-k --key)'{-k,--key}'[secret key]:secret key:->key' \
+      ':secret name:->secret'
+
+    case $state in
+      ns)
+        local -a namespaces
+        namespaces=($(kubectl get namespaces -o go-template='{{range .items}}{{.metadata.name}} {{end}}' 2>/dev/null))
+        _describe 'namespace' namespaces
+        ;;
+      secret)
+        local ns_val=${opt_args[-n]:-$(kubectl config view --minify -o jsonpath='{.contexts[0].context.namespace}' 2>/dev/null)}
+        ns_val=${ns_val:-default}
+        local -a secrets
+        secrets=($(kubectl get secrets -n "$ns_val" -o go-template='{{range .items}}{{.metadata.name}} {{end}}' 2>/dev/null))
+        _describe 'secret' secrets
+        ;;
+      key)
+        local ns_val=${opt_args[-n]:-$(kubectl config view --minify -o jsonpath='{.contexts[0].context.namespace}' 2>/dev/null)}
+        ns_val=${ns_val:-default}
+
+        local i w skip=0 secret_name=""
+        for (( i=2; i<CURRENT; i++ )); do
+          w=${words[i]}
+          if [ $skip -eq 1 ]; then
+            skip=0
+            continue
+          fi
+          case $w in
+            -n|-k|--key) skip=1 ;;
+            -*) ;;
+            *) secret_name=$w; break ;;
+          esac
+        done
+
+        if [ -n "$secret_name" ]; then
+          local -a keys
+          keys=($(kubectl get secret -n "$ns_val" "$secret_name" -o go-template='{{range $k,$v := .data}}{{$k}} {{end}}' 2>/dev/null))
+          _describe 'secret key' keys
+        fi
+        ;;
+    esac
+  }
+
+  _zcomp_kcm() {
+    local context state state_descr line
+    typeset -A opt_args
+
+    _arguments \
+      '(-h --help)'{-h,--help}'[show help]' \
+      '-n[namespace]:namespace:->ns' \
+      '(-k --key)'{-k,--key}'[configmap key]:configmap key:->key' \
+      ':configmap name:->cm'
+
+    case $state in
+      ns)
+        local -a namespaces
+        namespaces=($(kubectl get namespaces -o go-template='{{range .items}}{{.metadata.name}} {{end}}' 2>/dev/null))
+        _describe 'namespace' namespaces
+        ;;
+      cm)
+        local ns_val=${opt_args[-n]:-$(kubectl config view --minify -o jsonpath='{.contexts[0].context.namespace}' 2>/dev/null)}
+        ns_val=${ns_val:-default}
+        local -a cms
+        cms=($(kubectl get configmaps -n "$ns_val" -o go-template='{{range .items}}{{.metadata.name}} {{end}}' 2>/dev/null))
+        _describe 'configmap' cms
+        ;;
+      key)
+        local ns_val=${opt_args[-n]:-$(kubectl config view --minify -o jsonpath='{.contexts[0].context.namespace}' 2>/dev/null)}
+        ns_val=${ns_val:-default}
+
+        local i w skip=0 cm_name=""
+        for (( i=2; i<CURRENT; i++ )); do
+          w=${words[i]}
+          if [ $skip -eq 1 ]; then
+            skip=0
+            continue
+          fi
+          case $w in
+            -n|-k|--key) skip=1 ;;
+            -*) ;;
+            *) cm_name=$w; break ;;
+          esac
+        done
+
+        if [ -n "$cm_name" ]; then
+          local -a keys
+          keys=($(kubectl get configmap -n "$ns_val" "$cm_name" -o go-template='{{range $k,$v := .data}}{{$k}} {{end}}' 2>/dev/null))
+          _describe 'configmap key' keys
+        fi
+        ;;
+    esac
+  }
+
+  _zcomp_gouse() {
+    if [ "$CURRENT" -eq 2 ]; then
+      local -a vers
+      vers=($(ls -d /usr/local/go-* 2>/dev/null | sed 's|.*/go-||'))
+      if [ ${#vers} -gt 0 ]; then
+        _values 'version' $vers
+      else
+        _message 'version (no versions installed)'
+      fi
+    fi
+  }
+
+  compdef _zcomp_kuse u_kuse
+  compdef _zcomp_kpo u_kpo
+  compdef _zcomp_kpo u_kponr
+  compdef _zcomp_ksecret u_ksecret
+  compdef _zcomp_kcm u_kcm
+  compdef _zcomp_gouse u_gouse
+
+elif [ -n "$BASH_VERSION" ]; then
+  _bcomp_kuse() {
+    local cur
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+
+    local files=($(find "$HOME/.kube" -maxdepth 1 -name "config-*" 2>/dev/null))
+    local targets=()
+    for f in "${files[@]}"; do
+      targets+=("${f##*/config-}")
+    done
+
+    COMPREPLY=($(compgen -W "${targets[*]}" -- "$cur"))
+  }
+
+  _bcomp_kpo() {
+    local cur prev
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    if [[ "$prev" == "-n" ]]; then
+      local namespaces=$(kubectl get namespaces -o go-template='{{range .items}}{{.metadata.name}} {{end}}' 2>/dev/null)
+      COMPREPLY=($(compgen -W "$namespaces" -- "$cur"))
+      return 0
+    fi
+
+    if [[ "$cur" == -* ]]; then
+      COMPREPLY=($(compgen -W "--extra --show-labels -A --all-namespaces -n" -- "$cur"))
+      return 0
+    fi
+  }
+
+  _bcomp_ksecret() {
+    local cur prev words cword
+    _get_comp_words_by_ref -n : cur prev words cword 2>/dev/null || {
+      cur="${COMP_WORDS[COMP_CWORD]}"
+      prev="${COMP_WORDS[COMP_CWORD-1]}"
+      words=("${COMP_WORDS[@]}")
+      cword=$COMP_CWORD
+    }
+
+    COMPREPLY=()
+
+    if [[ "$prev" == "-n" ]]; then
+      local namespaces=$(kubectl get namespaces -o go-template='{{range .items}}{{.metadata.name}} {{end}}' 2>/dev/null)
+      COMPREPLY=($(compgen -W "$namespaces" -- "$cur"))
+      return 0
+    fi
+
+    local ns_val=""
+    local secret_name=""
+    local i
+
+    for ((i=1; i<cword; i++)); do
+      if [[ "${words[i]}" == "-n" ]]; then
+        ns_val="${words[i+1]}"
+      fi
+    done
+    if [ -z "$ns_val" ]; then
+      ns_val=$(kubectl config view --minify -o jsonpath='{.contexts[0].context.namespace}' 2>/dev/null)
+      ns_val="${ns_val:-default}"
+    fi
+
+    for ((i=1; i<cword; i++)); do
+      if [[ "${words[i]}" == -* ]]; then
+        if [[ "${words[i]}" == "-n" || "${words[i]}" == "-k" || "${words[i]}" == "--key" ]]; then
+          ((i++))
+        fi
+      else
+        secret_name="${words[i]}"
+        break
+      fi
+    done
+
+    if [[ "$prev" == "-k" || "$prev" == "--key" ]]; then
+      if [ -n "$secret_name" ]; then
+        local keys=$(kubectl get secret -n "$ns_val" "$secret_name" -o go-template='{{range $k,$v := .data}}{{$k}} {{end}}' 2>/dev/null)
+        COMPREPLY=($(compgen -W "$keys" -- "$cur"))
+      fi
+      return 0
+    fi
+
+    if [[ "$cur" == -* ]]; then
+      COMPREPLY=($(compgen -W "-h --help -n -k --key" -- "$cur"))
+      return 0
+    fi
+
+    local secrets=$(kubectl get secrets -n "$ns_val" -o go-template='{{range .items}}{{.metadata.name}} {{end}}' 2>/dev/null)
+    COMPREPLY=($(compgen -W "$secrets" -- "$cur"))
+  }
+
+  _bcomp_kcm() {
+    local cur prev words cword
+    _get_comp_words_by_ref -n : cur prev words cword 2>/dev/null || {
+      cur="${COMP_WORDS[COMP_CWORD]}"
+      prev="${COMP_WORDS[COMP_CWORD-1]}"
+      words=("${COMP_WORDS[@]}")
+      cword=$COMP_CWORD
+    }
+
+    COMPREPLY=()
+
+    if [[ "$prev" == "-n" ]]; then
+      local namespaces=$(kubectl get namespaces -o go-template='{{range .items}}{{.metadata.name}} {{end}}' 2>/dev/null)
+      COMPREPLY=($(compgen -W "$namespaces" -- "$cur"))
+      return 0
+    fi
+
+    local ns_val=""
+    local cm_name=""
+    local i
+
+    for ((i=1; i<cword; i++)); do
+      if [[ "${words[i]}" == "-n" ]]; then
+        ns_val="${words[i+1]}"
+      fi
+    done
+    if [ -z "$ns_val" ]; then
+      ns_val=$(kubectl config view --minify -o jsonpath='{.contexts[0].context.namespace}' 2>/dev/null)
+      ns_val="${ns_val:-default}"
+    fi
+
+    for ((i=1; i<cword; i++)); do
+      if [[ "${words[i]}" == -* ]]; then
+        if [[ "${words[i]}" == "-n" || "${words[i]}" == "-k" || "${words[i]}" == "--key" ]]; then
+          ((i++))
+        fi
+      else
+        cm_name="${words[i]}"
+        break
+      fi
+    done
+
+    if [[ "$prev" == "-k" || "$prev" == "--key" ]]; then
+      if [ -n "$cm_name" ]; then
+        local keys=$(kubectl get configmap -n "$ns_val" "$cm_name" -o go-template='{{range $k,$v := .data}}{{$k}} {{end}}' 2>/dev/null)
+        COMPREPLY=($(compgen -W "$keys" -- "$cur"))
+      fi
+      return 0
+    fi
+
+    if [[ "$cur" == -* ]]; then
+      COMPREPLY=($(compgen -W "-h --help -n -k --key" -- "$cur"))
+      return 0
+    fi
+
+    local cms=$(kubectl get configmaps -n "$ns_val" -o go-template='{{range .items}}{{.metadata.name}} {{end}}' 2>/dev/null)
+    COMPREPLY=($(compgen -W "$cms" -- "$cur"))
+  }
+
+  _bcomp_gouse() {
+    local cur
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+
+    if [ "$COMP_CWORD" -eq 1 ]; then
+      local dirs=($(ls -d /usr/local/go-* 2>/dev/null))
+      local vers=()
+      for d in "${dirs[@]}"; do
+        vers+=("${d##*/go-}")
+      done
+      COMPREPLY=($(compgen -W "${vers[*]}" -- "$cur"))
+    fi
+  }
+
+  complete -F _bcomp_kuse u_kuse
+  complete -F _bcomp_kpo u_kpo
+  complete -F _bcomp_kpo u_kponr
+  complete -F _bcomp_ksecret u_ksecret
+  complete -F _bcomp_kcm u_kcm
+  complete -F _bcomp_gouse u_gouse
+fi

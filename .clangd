@@ -1,0 +1,22 @@
+If:
+  PathMatch: .*\.bpf\.c$
+CompileFlags:
+  Add:
+    - -target
+    - bpf
+    - -D__TARGET_ARCH_x86
+    - -Wno-unused-value
+    - -Wno-pointer-sign
+    - -Wno-compare-distinct-pointer-types
+---
+If:
+  PathMatch: .*\.c$
+  PathExclude: .*\.bpf\.c$
+CompileFlags:
+  Add:
+    - -I/usr/include/bpf
+    - -Wno-unused-value
+
+Diagnostics:
+  Suppress:
+    - bugprone-sizeof-expression
